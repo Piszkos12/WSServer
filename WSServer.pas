@@ -232,7 +232,8 @@ begin
       for i := 0 to FrameSize - 1 do
         Frame := Frame + AnsiChar(Byte(TConnectionData(Socket.Data).Buffer[transformed_octet + i])
             xor Byte(TConnectionData(Socket.Data).Buffer[masking_key_octet + i mod 4]));
-    end
+      TConnectionData(Socket.Data).Buffer := RightStr(TConnectionData(Socket.Data).Buffer,
+          Length(TConnectionData(Socket.Data).Buffer) - FrameSize - 6);    end
     else
     begin
       for i := 0 to FrameSize - 1 do
