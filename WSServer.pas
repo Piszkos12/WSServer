@@ -2,15 +2,28 @@ unit WSServer;
 
 interface
 
-uses Windows, SysUtils, ScktComp, StrUtils, EncdDecd, Hash;
+uses
+  System.SysUtils, System.StrUtils, System.Hash, System.NetEncoding, System.Win.ScktComp;
 
 const
   ctOpenedForHTTP = 0;
   ctOpenedForWS = 1;
 
-  HTTP_EOL: AnsiString = #13#10;
+  HTTP_EOL: string = #13#10;
 
   WebSocketMagicString = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+
+  wsFIN: Byte = $80;
+  wsMASKED: Byte = $80;
+
+  wsOpcodeContinuation = $00;
+  wsOpcodeText = $01;
+  wsOpcodeBinary = $02;
+  wsOpcodeClose = $08;
+  wsOpcodePing = $09;
+  wsOpcodePong = $0A;
+
+  DefaultMaxFrameSize: Int64 = 16 * 1024 * 1024; // 16 MB safety cap
 
 type
   TConnectionData = class(TObject)
@@ -18,22 +31,33 @@ type
   private
     Data: Pointer;
     ConnectionType: Integer;
-    Buffer: AnsiString;
-    SecWebSocketAcceptKey: AnsiString;
-    SecWebSocketKey: AnsiString;
-    SecWebSocketVersion: AnsiString;
+    Buffer: TBytes;
+    FragmentBuffer: TBytes;
+    FragmentIsText: Boolean;
+    SecWebSocketAcceptKey: string;
+    SecWebSocketKey: string;
+    SecWebSocketVersion: string;
+    HttpMethod: string;
+    Path: string;
+    GotRequestLine: Boolean;
+    HasUpgradeHeader: Boolean;
+    HasConnectionUpgrade: Boolean;
   end;
 
   TOnClientConnect = Procedure(var Socket: TCustomWinSocket) of object;
   TOnClientDisconnect = Procedure(var Socket: TCustomWinSocket) of object;
-  TOnClientSwitchProtocol = Procedure(var Socket: TCustomWinSocket; SecWebSocketAcceptKey, SecWebSocketKey, SecWebSocketVersion: AnsiString) of object;
-  TOnClientFrameReceived = Procedure(var Socket: TCustomWinSocket; Frame: AnsiString) of object;
+  TOnClientSwitchProtocol = Procedure(var Socket: TCustomWinSocket; SecWebSocketAcceptKey, SecWebSocketKey,
+    SecWebSocketVersion, Path: string) of object;
+  TOnClientFrameReceived = Procedure(var Socket: TCustomWinSocket; Frame: string) of object;
+  TOnClientBinaryFrameReceived = Procedure(var Socket: TCustomWinSocket; Data: TBytes) of object;
 
   TWSServer = class(TObject)
   private
     fPort: Integer;
     fSocket: TServerSocket;
+    fMaxFrameSize: Int64;
     fOnClientFrameReceived: TOnClientFrameReceived;
+    fOnClientBinaryFrameReceived: TOnClientBinaryFrameReceived;
     fOnClientConnect: TOnClientConnect;
     fOnClientDisconnect: TOnClientDisconnect;
     fOnClientSwitchProtocol: TOnClientSwitchProtocol;
@@ -43,28 +67,71 @@ type
     Procedure CheckForData(var Socket: TCustomWinSocket);
     Procedure ProcessHTTPRequest(var Socket: TCustomWinSocket);
     Procedure ProcessWSFrame(var Socket: TCustomWinSocket);
-    Function HexToString(s: AnsiString): TBytes;
-    Function Seal(str: AnsiString): AnsiString;
+    Procedure BroadcastRaw(const Sealed: AnsiString);
+    Function Seal(const Payload: TBytes; OpCode: Byte): TBytes;
   public
     Constructor Create;
     Destructor Destroy; Override;
     Procedure SetPort(aPort: Integer);
     Procedure StartServer;
     Procedure StopServer;
-    Procedure Send(var Socket: TCustomWinSocket; FrameText: AnsiString);
-    Procedure Broadcast(FrameText: AnsiString);
+    Procedure Send(var Socket: TCustomWinSocket; FrameText: string); overload;
+    Procedure Send(var Socket: TCustomWinSocket; Data: TBytes); overload;
+    Procedure Broadcast(FrameText: string); overload;
+    Procedure Broadcast(Data: TBytes); overload;
     Property OnClientConnect: TOnClientConnect read fOnClientConnect write fOnClientConnect;
     Property OnClientDisconnect: TOnClientDisconnect read fOnClientDisconnect write fOnClientDisconnect;
     Property OnClientSwitchProtocol: TOnClientSwitchProtocol read fOnClientSwitchProtocol write fOnClientSwitchProtocol;
     Property OnClientFrameReceived: TOnClientFrameReceived read fOnClientFrameReceived write fOnClientFrameReceived;
+    Property OnClientBinaryFrameReceived: TOnClientBinaryFrameReceived read fOnClientBinaryFrameReceived
+      write fOnClientBinaryFrameReceived;
+    Property MaxFrameSize: Int64 read fMaxFrameSize write fMaxFrameSize;
   end;
 
 implementation
 
+// Raw byte-for-byte conversions for the ScktComp wire boundary (SendText/ReceiveText are AnsiString-typed
+// there because the component predates Unicode Delphi - it never interprets the bytes as text).
+function BytesToRawAnsiString(const B: TBytes): AnsiString;
+begin
+  SetLength(Result, Length(B));
+  if Length(B) > 0 then
+    Move(B[0], Result[1], Length(B));
+end;
+
+function RawAnsiStringToBytes(const S: AnsiString): TBytes;
+begin
+  SetLength(Result, Length(S));
+  if Length(S) > 0 then
+    Move(S[1], Result[0], Length(S));
+end;
+
+function ConcatBytes(const A, B: TBytes): TBytes;
+begin
+  SetLength(Result, Length(A) + Length(B));
+  if Length(A) > 0 then
+    Move(A[0], Result[0], Length(A));
+  if Length(B) > 0 then
+    Move(B[0], Result[Length(A)], Length(B));
+end;
+
+// Returns the 0-based index of the CR in the next CRLF sequence, or -1 if none is buffered yet.
+function FindCRLF(const B: TBytes): Integer;
+var
+  i: Integer;
+begin
+  Result := -1;
+  for i := 0 to Length(B) - 2 do
+    if (B[i] = 13) and (B[i + 1] = 10) then
+    begin
+      Result := i;
+      Exit;
+    end;
+end;
+
 Constructor TConnectionData.Create;
 begin
   ConnectionType := ctOpenedForHTTP;
-  Buffer := '';
 end;
 
 Constructor TWSServer.Create;
@@ -73,6 +140,7 @@ begin
   fSocket.OnClientConnect := ClientSocketConnect;
   fSocket.OnClientDisconnect := ClientSocketDisconnect;
   fSocket.OnClientRead := ClientSocketRead;
+  fMaxFrameSize := DefaultMaxFrameSize;
 end;
 
 Destructor TWSServer.Destroy;
@@ -123,8 +191,11 @@ begin
 end;
 
 procedure TWSServer.ClientSocketRead(Sender: TObject; Socket: TCustomWinSocket);
+var
+  Conn: TConnectionData;
 begin
-  TConnectionData(Socket.Data).Buffer := TConnectionData(Socket.Data).Buffer + Socket.ReceiveText;
+  Conn := TConnectionData(Socket.Data);
+  Conn.Buffer := ConcatBytes(Conn.Buffer, RawAnsiStringToBytes(Socket.ReceiveText));
   CheckForData(Socket);
 end;
 
@@ -138,224 +209,300 @@ end;
 
 Procedure TWSServer.ProcessHTTPRequest(var Socket: TCustomWinSocket);
 var
-  line: AnsiString;
+  Conn: TConnectionData;
+  line: string;
+  eolPos: Integer;
 begin
-  while AnsiPos(HTTP_EOL, TConnectionData(Socket.Data).Buffer) > 0 do
+  Conn := TConnectionData(Socket.Data);
+  while True do
   begin
-    line := LeftStr(TConnectionData(Socket.Data).Buffer, pos(HTTP_EOL, TConnectionData(Socket.Data).Buffer) - 1);
-    TConnectionData(Socket.Data).Buffer := RightStr(TConnectionData(Socket.Data).Buffer, Length(TConnectionData(Socket.Data).Buffer) - pos(HTTP_EOL,
-      TConnectionData(Socket.Data).Buffer) - 1);
-    if LeftStr(line, 18) = 'Sec-WebSocket-Key:' then
+    eolPos := FindCRLF(Conn.Buffer);
+    if eolPos < 0 then
+      Exit; // wait for more data to arrive
+
+    line := TEncoding.ASCII.GetString(Conn.Buffer, 0, eolPos);
+    Conn.Buffer := Copy(Conn.Buffer, eolPos + 2, Length(Conn.Buffer) - eolPos - 2);
+
+    if not Conn.GotRequestLine then
     begin
-      TConnectionData(Socket.Data).SecWebSocketKey := RightStr(line, Length(line) - 19);
+      Conn.GotRequestLine := True;
+      Conn.HttpMethod := UpperCase(Trim(ExtractWord(1, line, [' '])));
+      Conn.Path := Trim(ExtractWord(2, line, [' ']));
+      Continue;
     end;
-    if LeftStr(line, 22) = 'Sec-WebSocket-Version:' then
-    begin
-      TConnectionData(Socket.Data).SecWebSocketVersion := RightStr(line, Length(line) - 23);
-    end;
+
+    if SameText(Copy(line, 1, 8), 'Upgrade:') and ContainsText(line, 'websocket') then
+      Conn.HasUpgradeHeader := True;
+
+    if SameText(Copy(line, 1, 11), 'Connection:') and ContainsText(line, 'Upgrade') then
+      Conn.HasConnectionUpgrade := True;
+
+    if SameText(Copy(line, 1, 18), 'Sec-WebSocket-Key:') then
+      Conn.SecWebSocketKey := Trim(Copy(line, 19, MaxInt));
+
+    if SameText(Copy(line, 1, 22), 'Sec-WebSocket-Version:') then
+      Conn.SecWebSocketVersion := Trim(Copy(line, 23, MaxInt));
+
     if line = '' then
     begin
-      TConnectionData(Socket.Data).Buffer := '';
-      TConnectionData(Socket.Data).ConnectionType := ctOpenedForWS;
+      // Blank line -> end of headers. Validate this is really a websocket upgrade request.
+      if (Conn.HttpMethod <> 'GET') or (not Conn.HasUpgradeHeader) or (not Conn.HasConnectionUpgrade) or
+        (Conn.SecWebSocketKey = '') then
+      begin
+        Socket.SendText(AnsiString('HTTP/1.1 400 Bad Request' + HTTP_EOL + HTTP_EOL));
+        Socket.Close;
+        Exit;
+      end;
 
-      TConnectionData(Socket.Data).SecWebSocketAcceptKey :=
-        EncodeBase64(HexToString(THashSHA1.GetHashString(TConnectionData(Socket.Data).SecWebSocketKey + WebSocketMagicString)),
-        Length(HexToString(THashSHA1.GetHashString(TConnectionData(Socket.Data).SecWebSocketKey + WebSocketMagicString))));
+      Conn.ConnectionType := ctOpenedForWS;
 
-      Socket.SendText('HTTP/1.1 101 Switching Protocols' + HTTP_EOL);
-      Socket.SendText('Upgrade: websocket' + HTTP_EOL);
-      Socket.SendText('Connection: Upgrade' + HTTP_EOL);
-      Socket.SendText('Sec-WebSocket-Accept: ' + TConnectionData(Socket.Data).SecWebSocketAcceptKey + HTTP_EOL);
-      Socket.SendText(HTTP_EOL);
+      Conn.SecWebSocketAcceptKey := TNetEncoding.Base64String.EncodeBytesToString(
+        THashSHA1.GetHashBytes(Conn.SecWebSocketKey + WebSocketMagicString));
+
+      Socket.SendText(AnsiString('HTTP/1.1 101 Switching Protocols' + HTTP_EOL + 'Upgrade: websocket' + HTTP_EOL +
+        'Connection: Upgrade' + HTTP_EOL + 'Sec-WebSocket-Accept: ' + Conn.SecWebSocketAcceptKey + HTTP_EOL +
+        HTTP_EOL));
 
       if Assigned(fOnClientSwitchProtocol) then
-        fOnClientSwitchProtocol(Socket, TConnectionData(Socket.Data).SecWebSocketAcceptKey, TConnectionData(Socket.Data).SecWebSocketKey,
-          TConnectionData(Socket.Data).SecWebSocketVersion);
+        fOnClientSwitchProtocol(Socket, Conn.SecWebSocketAcceptKey, Conn.SecWebSocketKey, Conn.SecWebSocketVersion,
+          Conn.Path);
+
+      // The client may have pipelined a WS frame right after the handshake in the same packet.
+      if Length(Conn.Buffer) > 0 then
+        ProcessWSFrame(Socket);
+      Exit;
     end;
   end;
 end;
 
 Procedure TWSServer.ProcessWSFrame(var Socket: TCustomWinSocket);
-const
-  _opcode_FinalFrame: Byte = $80;
-  _opcode_TextFrame = $01;
-  _opcode_BinaryFrame = $02;
-  _opcode_Close = $08;
-  _opcode_Ping = $09;
-  _opcode_Pong = $0A;
-  _masked: Byte = $80;
-
 var
+  Conn: TConnectionData;
   OPCODE: Byte;
-  LastFrame: Boolean;
-  _FrameSizeBits: Byte;
-  FrameSize: LongInt;
-  PayLoadAddress: Integer;
-  MaskAddress: Integer;
-  Mask: AnsiString;
-  Masked: Boolean;
-  FrameText: String;
+  LastFrame, Masked: Boolean;
+  FrameSizeBits: Byte;
+  FrameSize64: Int64;
+  PayloadLen, BaseHeaderSize, TotalHeaderSize, MaskOffset, PayloadOffset: Integer;
+  Mask: array [0 .. 3] of Byte;
+  Payload: TBytes;
   i: Integer;
-  HeaderSize: Integer;
-
 begin
-  PayLoadAddress := 7;
-  MaskAddress := 3;
-  HeaderSize := 2;
+  Conn := TConnectionData(Socket.Data);
 
-  if Length(TConnectionData(Socket.Data).Buffer) < 2 then
-    // Too short chunk - waiting for other data
-    Exit;
-
-  LastFrame := ((Byte(TConnectionData(Socket.Data).Buffer[1]) and _opcode_FinalFrame) = _opcode_FinalFrame);
-  OPCODE := Byte(TConnectionData(Socket.Data).Buffer[1]) and $0F;
-
-  _FrameSizeBits := Byte(TConnectionData(Socket.Data).Buffer[2]) and $7F;
-  if _FrameSizeBits = 126 then
+  while Length(Conn.Buffer) >= 2 do
   begin
-    FrameSize := Word(Byte(TConnectionData(Socket.Data).Buffer[3]) * 256 + Byte(TConnectionData(Socket.Data).Buffer[4]));
-    inc(MaskAddress, 2);
-    inc(PayLoadAddress, 2);
-    inc(HeaderSize, 2);
-  end
-  else if _FrameSizeBits = 127 then
-  begin
-    FrameSize := LongWord(Byte(TConnectionData(Socket.Data).Buffer[3]) * 256 * 256 * 256 * 256 * 256 * 256 * 256 + Byte(TConnectionData(Socket.Data).Buffer[4])
-      * 256 * 256 * 256 * 256 * 256 * 256 + Byte(TConnectionData(Socket.Data).Buffer[5]) * 256 * 256 * 256 * 256 * 256 +
-      Byte(TConnectionData(Socket.Data).Buffer[6]) * 256 * 256 * 256 * 256 + Byte(TConnectionData(Socket.Data).Buffer[7]) * 256 * 256 * 256 +
-      Byte(TConnectionData(Socket.Data).Buffer[8]) * 256 * 256 + Byte(TConnectionData(Socket.Data).Buffer[9]) * 256 +
-      Byte(TConnectionData(Socket.Data).Buffer[10]));
-    inc(MaskAddress, 8);
-    inc(PayLoadAddress, 8);
-    inc(HeaderSize, 8);
-  end
-  else
-    FrameSize := _FrameSizeBits;
+    LastFrame := ((Conn.Buffer[0] and wsFIN) = wsFIN);
+    OPCODE := Conn.Buffer[0] and $0F;
+    Masked := ((Conn.Buffer[1] and wsMASKED) = wsMASKED);
+    FrameSizeBits := Conn.Buffer[1] and $7F;
 
-  // if FrameSize < _HeaderShift + (TConnectionData(Socket.Data).Buffer) + 2 then
-  // exit;
-
-  if OPCODE = _opcode_Close then
-  begin
-    Socket.Close;
-    Exit;
-  end;
-
-  if OPCODE = _opcode_Ping then
-  begin
-    // Socket.SendText();
-    Exit;
-  end;
-
-  Masked := ((Byte(TConnectionData(Socket.Data).Buffer[2]) and _masked) = _masked);
-  if Masked then
-  begin
-    Mask := AnsiMidStr(TConnectionData(Socket.Data).Buffer, MaskAddress, 4);
-    inc(HeaderSize, 4);
-  end;
-
-  if OPCODE = _opcode_TextFrame then
-  begin
-    FrameText := '';
-    if Masked then
+    BaseHeaderSize := 2;
+    if FrameSizeBits = 126 then
     begin
-      for i := 0 to FrameSize - 1 do
-        FrameText := FrameText + AnsiChar(Byte(TConnectionData(Socket.Data).Buffer[PayLoadAddress + i]) xor Byte(Mask[1 + i mod 4]));
+      if Length(Conn.Buffer) < 4 then
+        Exit; // wait for the length bytes to arrive
+      FrameSize64 := (Conn.Buffer[2] shl 8) or Conn.Buffer[3];
+      BaseHeaderSize := 4;
+    end
+    else if FrameSizeBits = 127 then
+    begin
+      if Length(Conn.Buffer) < 10 then
+        Exit; // wait for the length bytes to arrive
+      FrameSize64 := 0;
+      for i := 2 to 9 do
+        FrameSize64 := (FrameSize64 shl 8) or Int64(Conn.Buffer[i]);
+      BaseHeaderSize := 10;
+    end
+    else
+      FrameSize64 := FrameSizeBits;
 
-      TConnectionData(Socket.Data).Buffer := RightStr(TConnectionData(Socket.Data).Buffer, Length(TConnectionData(Socket.Data).Buffer) - FrameSize -
-        HeaderSize);
+    if (FrameSize64 < 0) or (FrameSize64 > fMaxFrameSize) then
+    begin
+      // Bogus or oversized frame - refuse to allocate for it
+      Socket.Close;
+      Exit;
     end;
-    if Assigned(OnClientFrameReceived) then
-      OnClientFrameReceived(Socket, FrameText);
+    PayloadLen := Integer(FrameSize64);
+
+    MaskOffset := BaseHeaderSize;
+    TotalHeaderSize := BaseHeaderSize;
+    if Masked then
+      Inc(TotalHeaderSize, 4);
+    PayloadOffset := TotalHeaderSize;
+
+    if Length(Conn.Buffer) < TotalHeaderSize + PayloadLen then
+      Exit; // frame not fully received yet, wait for more data
+
+    if not Masked then
+    begin
+      // RFC 6455: all client-to-server frames MUST be masked
+      Socket.Close;
+      Exit;
+    end;
+
+    for i := 0 to 3 do
+      Mask[i] := Conn.Buffer[MaskOffset + i];
+
+    SetLength(Payload, PayloadLen);
+    for i := 0 to PayloadLen - 1 do
+      Payload[i] := Conn.Buffer[PayloadOffset + i] xor Mask[i mod 4];
+
+    Conn.Buffer := Copy(Conn.Buffer, TotalHeaderSize + PayloadLen, Length(Conn.Buffer) - TotalHeaderSize - PayloadLen);
+
+    case OPCODE of
+      wsOpcodeContinuation:
+        begin
+          Conn.FragmentBuffer := ConcatBytes(Conn.FragmentBuffer, Payload);
+          if LastFrame then
+          begin
+            if Conn.FragmentIsText then
+            begin
+              if Assigned(OnClientFrameReceived) then
+                OnClientFrameReceived(Socket, TEncoding.UTF8.GetString(Conn.FragmentBuffer));
+            end
+            else if Assigned(OnClientBinaryFrameReceived) then
+              OnClientBinaryFrameReceived(Socket, Conn.FragmentBuffer);
+            Conn.FragmentBuffer := nil;
+          end;
+        end;
+      wsOpcodeText:
+        begin
+          if LastFrame then
+          begin
+            if Assigned(OnClientFrameReceived) then
+              OnClientFrameReceived(Socket, TEncoding.UTF8.GetString(Payload));
+          end
+          else
+          begin
+            Conn.FragmentIsText := True;
+            Conn.FragmentBuffer := Payload;
+          end;
+        end;
+      wsOpcodeBinary:
+        begin
+          if LastFrame then
+          begin
+            if Assigned(OnClientBinaryFrameReceived) then
+              OnClientBinaryFrameReceived(Socket, Payload);
+          end
+          else
+          begin
+            Conn.FragmentIsText := False;
+            Conn.FragmentBuffer := Payload;
+          end;
+        end;
+      wsOpcodeClose:
+        begin
+          try
+            Socket.SendText(BytesToRawAnsiString(Seal(nil, wsOpcodeClose)));
+          except
+            ;
+          end;
+          Socket.Close;
+          Exit;
+        end;
+      wsOpcodePing:
+        begin
+          try
+            Socket.SendText(BytesToRawAnsiString(Seal(Payload, wsOpcodePong)));
+          except
+            ;
+          end;
+        end;
+      wsOpcodePong:
+        ; // keepalive acknowledgement, nothing to do
+    end;
   end;
 end;
 
-Function TWSServer.HexToString(s: AnsiString): TBytes;
+Function TWSServer.Seal(const Payload: TBytes; OpCode: Byte): TBytes;
 var
+  HeaderLen, PayloadLen: Integer;
+  PayloadLengthWord: Word;
+  PayloadLength64: UInt64;
   i: Integer;
-  astr: Array of AnsiString;
-  abyte: Array of Byte;
 begin
-  SetLength(Result, Length(s) div 2);
-  SetLength(astr, Length(s) div 2);
-  SetLength(abyte, Length(s) div 2);
-  for i := 0 to Length(s) div 2 - 1 do
-    astr[i] := '$' + s[i * 2 + 1] + s[i * 2 + 2];
-  for i := 0 to Length(astr) - 1 do
-    abyte[i] := StrToInt(astr[i]);
-  for i := 0 to Length(astr) - 1 do
-    Result[i] := abyte[i];
-  SetLength(abyte, 0);
-  SetLength(astr, 0);
-end;
-
-Function TWSServer.Seal(str: AnsiString): AnsiString;
-var
-  Mask: LongWord;
-  i: Integer;
-  PayLoadLengthWord: Word;
-  PayLoadLengthLongWord: LongWord;
-  PayLoadBytes: Array [1 .. 8] of AnsiChar;
-begin
-  Mask := Random(high(Mask));
-  if Length(str) < 126 then
+  PayloadLen := Length(Payload);
+  if PayloadLen < 126 then
   begin
-    SetLength(Result, Length(str) + 2);
-    Result[1] := #$81;
-    Result[2] := AnsiChar(Byte(Length(str)));
-    for i := 0 to Length(str) - 1 do
-      Result[3 + i] := str[i + 1];
+    HeaderLen := 2;
+    SetLength(Result, HeaderLen + PayloadLen);
+    Result[0] := wsFIN or OpCode;
+    Result[1] := Byte(PayloadLen);
   end
-  else if Length(str) < 65536 then
+  else if PayloadLen < 65536 then
   begin
-    SetLength(Result, Length(str) + 2 + 2);
-    Result[1] := #$81;
-    Result[2] := #$7E; // 126
-    PayLoadLengthWord := Length(str);
-    Result[3] := AnsiChar(hi(PayLoadLengthWord));
-    Result[4] := AnsiChar(lo(PayLoadLengthWord));
-    for i := 0 to Length(str) - 1 do
-      Result[3 + 2 + i] := str[i + 1];
+    HeaderLen := 4;
+    SetLength(Result, HeaderLen + PayloadLen);
+    Result[0] := wsFIN or OpCode;
+    Result[1] := $7E; // 126 -> 16 bit extended length follows
+    PayloadLengthWord := PayloadLen;
+    Result[2] := Hi(PayloadLengthWord);
+    Result[3] := Lo(PayloadLengthWord);
   end
   else
   begin
-    SetLength(Result, Length(str) + 2 + 8);
-    Result[1] := #$81;
-    Result[2] := #$7F; // 127
-    PayLoadLengthLongWord := Length(str);
-    move(PayLoadLengthLongWord, PayLoadBytes, 8);
-    Result[3] := PayLoadBytes[8];
-    Result[4] := PayLoadBytes[7];
-    Result[5] := PayLoadBytes[6];
-    Result[6] := PayLoadBytes[5];
-    Result[7] := PayLoadBytes[4];
-    Result[8] := PayLoadBytes[3];
-    Result[9] := PayLoadBytes[2];
-    Result[10] := PayLoadBytes[1];
-    for i := 0 to Length(str) - 1 do
-      Result[3 + 8 + i] := str[i + 1];
+    HeaderLen := 10;
+    SetLength(Result, HeaderLen + PayloadLen);
+    Result[0] := wsFIN or OpCode;
+    Result[1] := $7F; // 127 -> 64 bit extended length follows
+    PayloadLength64 := UInt64(PayloadLen);
+    for i := 0 to 7 do
+      Result[2 + i] := Byte(PayloadLength64 shr ((7 - i) * 8));
+  end;
+  if PayloadLen > 0 then
+    Move(Payload[0], Result[HeaderLen], PayloadLen);
+end;
+
+Procedure TWSServer.Send(var Socket: TCustomWinSocket; FrameText: string);
+begin
+  if not Assigned(Socket) then
+    Exit;
+  try
+    Socket.SendText(BytesToRawAnsiString(Seal(TEncoding.UTF8.GetBytes(FrameText), wsOpcodeText)));
+  except
+    ; // socket may already have been closed by the peer
   end;
 end;
 
-Procedure TWSServer.Send(var Socket: TCustomWinSocket; FrameText: AnsiString);
+Procedure TWSServer.Send(var Socket: TCustomWinSocket; Data: TBytes);
 begin
-  Socket.SendText(Seal(FrameText));
+  if not Assigned(Socket) then
+    Exit;
+  try
+    Socket.SendText(BytesToRawAnsiString(Seal(Data, wsOpcodeBinary)));
+  except
+    ; // socket may already have been closed by the peer
+  end;
 end;
 
-Procedure TWSServer.Broadcast(FrameText: AnsiString);
+Procedure TWSServer.BroadcastRaw(const Sealed: AnsiString);
 var
   i: Integer;
 begin
   fSocket.Socket.Lock;
-  for i := 0 to fSocket.Socket.ActiveConnections - 1 do
-  begin
-    try
-      fSocket.Socket.Connections[i].SendText(Seal(FrameText));
-    except
-      ; // Már nem van a socket mire ideértünk.
+  try
+    for i := 0 to fSocket.Socket.ActiveConnections - 1 do
+    begin
+      try
+        fSocket.Socket.Connections[i].SendText(Sealed);
+      except
+        ; // socket may already have been closed by the peer
+      end;
     end;
+  finally
+    fSocket.Socket.Unlock;
   end;
-  fSocket.Socket.Lock;
+end;
+
+Procedure TWSServer.Broadcast(FrameText: string);
+begin
+  BroadcastRaw(BytesToRawAnsiString(Seal(TEncoding.UTF8.GetBytes(FrameText), wsOpcodeText)));
+end;
+
+Procedure TWSServer.Broadcast(Data: TBytes);
+begin
+  BroadcastRaw(BytesToRawAnsiString(Seal(Data, wsOpcodeBinary)));
 end;
 
 end.
