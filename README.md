@@ -87,9 +87,10 @@ end;
 
 Notes:
 - The public API uses plain Unicode `string` for text and `TBytes` for binary data - no `AnsiString` anywhere except internally, right at the `TCustomWinSocket.SendText`/`ReceiveText` boundary (which is `AnsiString`-typed because that VCL component predates Unicode Delphi and only ever treats it as a raw byte buffer).
-- Text frames are UTF-8 on the wire, per the WebSocket spec.
-- Ping frames are answered with Pong automatically; Close frames are acknowledged and the socket is closed.
+- Text frames are UTF-8 on the wire, validated on receipt; invalid UTF-8, bad RSV bits, unknown opcodes, malformed fragmentation and invalid Close payloads are all rejected with an RFC 6455-compliant Close frame.
+- Ping frames are answered with Pong automatically; Close frames are validated and acknowledged before the socket is closed.
 - Fragmented messages (continuation frames) are reassembled before `OnClientFrameReceived` / `OnClientBinaryFrameReceived` fires.
-- Non-websocket / malformed HTTP requests get a `400 Bad Request` instead of being upgraded.
-- `WSServer.MaxFrameSize` (default 16 MB) caps the accepted payload size per frame.
-- Depends only on `System.SysUtils`, `System.StrUtils`, `System.Hash`, `System.NetEncoding` and `System.Win.ScktComp` - all standard RTL/VCL units, no third-party packages.
+- Non-websocket / malformed HTTP requests get a `400 Bad Request`, and an unsupported `Sec-WebSocket-Version` gets a `426 Upgrade Required` instead of being upgraded.
+- `WSServer.MaxFrameSize` (default 16 MB) caps both a single frame's payload and a reassembled fragmented message; `WSServer.MaxHTTPHeaderSize` (default 8 KB) caps the handshake header block.
+- `Broadcast` only reaches clients that completed the WebSocket handshake, not ones still mid-HTTP.
+- Depends only on `System.SysUtils`, `System.Hash`, `System.NetEncoding` and `System.Win.ScktComp` - all standard RTL/VCL units, no third-party packages.

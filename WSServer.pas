@@ -3,7 +3,7 @@ unit WSServer;
 interface
 
 uses
-  System.SysUtils, System.StrUtils, System.Hash, System.NetEncoding, System.Win.ScktComp;
+  System.SysUtils, System.Hash, System.NetEncoding, System.Win.ScktComp;
 
 const
   ctOpenedForHTTP = 0;
@@ -23,7 +23,12 @@ const
   wsOpcodePing = $09;
   wsOpcodePong = $0A;
 
-  DefaultMaxFrameSize: Int64 = 16 * 1024 * 1024; // 16 MB safety cap
+  DefaultMaxFrameSize: Int64 = 16 * 1024 * 1024; // 16 MB safety cap; also caps a reassembled fragmented message
+  DefaultMaxHTTPHeaderSize: Integer = 8 * 1024; // 8 KB safety cap for the handshake header block
+
+  wsCloseProtocolError: Word = 1002;
+  wsCloseInvalidPayload: Word = 1007;
+  wsCloseMessageTooBig: Word = 1009;
 
 type
   TConnectionData = class(TObject)
@@ -33,6 +38,7 @@ type
     ConnectionType: Integer;
     Buffer: TBytes;
     FragmentBuffer: TBytes;
+    FragmentActive: Boolean;
     FragmentIsText: Boolean;
     SecWebSocketAcceptKey: string;
     SecWebSocketKey: string;
@@ -42,6 +48,7 @@ type
     GotRequestLine: Boolean;
     HasUpgradeHeader: Boolean;
     HasConnectionUpgrade: Boolean;
+    HttpHeaderBytesConsumed: Integer;
   end;
 
   TOnClientConnect = Procedure(var Socket: TCustomWinSocket) of object;
@@ -56,6 +63,7 @@ type
     fPort: Integer;
     fSocket: TServerSocket;
     fMaxFrameSize: Int64;
+    fMaxHTTPHeaderSize: Integer;
     fOnClientFrameReceived: TOnClientFrameReceived;
     fOnClientBinaryFrameReceived: TOnClientBinaryFrameReceived;
     fOnClientConnect: TOnClientConnect;
@@ -69,6 +77,7 @@ type
     Procedure ProcessWSFrame(var Socket: TCustomWinSocket);
     Procedure BroadcastRaw(const Sealed: AnsiString);
     Function Seal(const Payload: TBytes; OpCode: Byte): TBytes;
+    Procedure CloseWithError(var Socket: TCustomWinSocket; StatusCode: Word);
   public
     Constructor Create;
     Destructor Destroy; Override;
@@ -86,6 +95,7 @@ type
     Property OnClientBinaryFrameReceived: TOnClientBinaryFrameReceived read fOnClientBinaryFrameReceived
       write fOnClientBinaryFrameReceived;
     Property MaxFrameSize: Int64 read fMaxFrameSize write fMaxFrameSize;
+    Property MaxHTTPHeaderSize: Integer read fMaxHTTPHeaderSize write fMaxHTTPHeaderSize;
   end;
 
 implementation
@@ -129,6 +139,119 @@ begin
     end;
 end;
 
+// Returns the Index-th (1-based) space-delimited token from S, skipping repeated spaces.
+function ExtractHttpToken(const S: string; Index: Integer): string;
+var
+  i, wordIdx, startPos: Integer;
+  inWord: Boolean;
+begin
+  Result := '';
+  wordIdx := 0;
+  inWord := False;
+  startPos := 1;
+  for i := 1 to Length(S) do
+  begin
+    if S[i] = ' ' then
+    begin
+      if inWord then
+      begin
+        Inc(wordIdx);
+        if wordIdx = Index then
+        begin
+          Result := Copy(S, startPos, i - startPos);
+          Exit;
+        end;
+        inWord := False;
+      end;
+    end
+    else if not inWord then
+    begin
+      startPos := i;
+      inWord := True;
+    end;
+  end;
+  if inWord then
+  begin
+    Inc(wordIdx);
+    if wordIdx = Index then
+      Result := Copy(S, startPos, Length(S) - startPos + 1);
+  end;
+end;
+
+function ContainsTextCI(const S, SubStr: string): Boolean;
+begin
+  Result := Pos(UpperCase(SubStr), UpperCase(S)) > 0;
+end;
+
+// Well-formed UTF-8 byte sequence check per the Unicode Standard (Table 3-7),
+// rejecting overlong encodings, surrogate halves and out-of-range code points.
+function IsValidUTF8(const B: TBytes): Boolean;
+var
+  i, n: Integer;
+  b0, b1, b2, b3: Byte;
+begin
+  i := 0;
+  n := Length(B);
+  while i < n do
+  begin
+    b0 := B[i];
+    if b0 <= $7F then
+      Inc(i)
+    else if (b0 >= $C2) and (b0 <= $DF) then
+    begin
+      if i + 1 >= n then Exit(False);
+      b1 := B[i + 1];
+      if (b1 < $80) or (b1 > $BF) then Exit(False);
+      Inc(i, 2);
+    end
+    else if (b0 = $E0) or ((b0 >= $E1) and (b0 <= $EC)) or (b0 = $ED) or ((b0 >= $EE) and (b0 <= $EF)) then
+    begin
+      if i + 2 >= n then Exit(False);
+      b1 := B[i + 1];
+      b2 := B[i + 2];
+      if b0 = $E0 then
+      begin
+        if (b1 < $A0) or (b1 > $BF) then Exit(False);
+      end
+      else if b0 = $ED then
+      begin
+        if (b1 < $80) or (b1 > $9F) then Exit(False); // exclude UTF-16 surrogate halves
+      end
+      else if (b1 < $80) or (b1 > $BF) then Exit(False);
+      if (b2 < $80) or (b2 > $BF) then Exit(False);
+      Inc(i, 3);
+    end
+    else if (b0 = $F0) or ((b0 >= $F1) and (b0 <= $F3)) or (b0 = $F4) then
+    begin
+      if i + 3 >= n then Exit(False);
+      b1 := B[i + 1];
+      b2 := B[i + 2];
+      b3 := B[i + 3];
+      if b0 = $F0 then
+      begin
+        if (b1 < $90) or (b1 > $BF) then Exit(False);
+      end
+      else if b0 = $F4 then
+      begin
+        if (b1 < $80) or (b1 > $8F) then Exit(False); // exclude code points above U+10FFFF
+      end
+      else if (b1 < $80) or (b1 > $BF) then Exit(False);
+      if (b2 < $80) or (b2 > $BF) then Exit(False);
+      if (b3 < $80) or (b3 > $BF) then Exit(False);
+      Inc(i, 4);
+    end
+    else
+      Exit(False);
+  end;
+  Result := True;
+end;
+
+function IsValidCloseStatusCode(Code: Integer): Boolean;
+begin
+  Result := ((Code >= 1000) and (Code <= 1014) and (Code <> 1004) and (Code <> 1005) and (Code <> 1006)) or
+    ((Code >= 3000) and (Code <= 4999));
+end;
+
 Constructor TConnectionData.Create;
 begin
   ConnectionType := ctOpenedForHTTP;
@@ -141,6 +264,7 @@ begin
   fSocket.OnClientDisconnect := ClientSocketDisconnect;
   fSocket.OnClientRead := ClientSocketRead;
   fMaxFrameSize := DefaultMaxFrameSize;
+  fMaxHTTPHeaderSize := DefaultMaxHTTPHeaderSize;
 end;
 
 Destructor TWSServer.Destroy;
@@ -218,23 +342,38 @@ begin
   begin
     eolPos := FindCRLF(Conn.Buffer);
     if eolPos < 0 then
+    begin
+      if Conn.HttpHeaderBytesConsumed + Length(Conn.Buffer) > fMaxHTTPHeaderSize then
+      begin
+        Socket.SendText(AnsiString('HTTP/1.1 400 Bad Request' + HTTP_EOL + HTTP_EOL));
+        Socket.Close;
+      end;
       Exit; // wait for more data to arrive
+    end;
 
     line := TEncoding.ASCII.GetString(Conn.Buffer, 0, eolPos);
     Conn.Buffer := Copy(Conn.Buffer, eolPos + 2, Length(Conn.Buffer) - eolPos - 2);
+    Inc(Conn.HttpHeaderBytesConsumed, eolPos + 2);
+
+    if Conn.HttpHeaderBytesConsumed > fMaxHTTPHeaderSize then
+    begin
+      Socket.SendText(AnsiString('HTTP/1.1 400 Bad Request' + HTTP_EOL + HTTP_EOL));
+      Socket.Close;
+      Exit;
+    end;
 
     if not Conn.GotRequestLine then
     begin
       Conn.GotRequestLine := True;
-      Conn.HttpMethod := UpperCase(Trim(ExtractWord(1, line, [' '])));
-      Conn.Path := Trim(ExtractWord(2, line, [' ']));
+      Conn.HttpMethod := UpperCase(Trim(ExtractHttpToken(line, 1)));
+      Conn.Path := Trim(ExtractHttpToken(line, 2));
       Continue;
     end;
 
-    if SameText(Copy(line, 1, 8), 'Upgrade:') and ContainsText(line, 'websocket') then
+    if SameText(Copy(line, 1, 8), 'Upgrade:') and ContainsTextCI(line, 'websocket') then
       Conn.HasUpgradeHeader := True;
 
-    if SameText(Copy(line, 1, 11), 'Connection:') and ContainsText(line, 'Upgrade') then
+    if SameText(Copy(line, 1, 11), 'Connection:') and ContainsTextCI(line, 'Upgrade') then
       Conn.HasConnectionUpgrade := True;
 
     if SameText(Copy(line, 1, 18), 'Sec-WebSocket-Key:') then
@@ -250,6 +389,15 @@ begin
         (Conn.SecWebSocketKey = '') then
       begin
         Socket.SendText(AnsiString('HTTP/1.1 400 Bad Request' + HTTP_EOL + HTTP_EOL));
+        Socket.Close;
+        Exit;
+      end;
+
+      if Conn.SecWebSocketVersion <> '13' then
+      begin
+        // RFC 6455 4.4: tell the client which version(s) we do support
+        Socket.SendText(AnsiString('HTTP/1.1 426 Upgrade Required' + HTTP_EOL + 'Sec-WebSocket-Version: 13' +
+          HTTP_EOL + HTTP_EOL));
         Socket.Close;
         Exit;
       end;
@@ -279,12 +427,13 @@ Procedure TWSServer.ProcessWSFrame(var Socket: TCustomWinSocket);
 var
   Conn: TConnectionData;
   OPCODE: Byte;
-  LastFrame, Masked: Boolean;
+  LastFrame, Masked, IsControlFrame: Boolean;
   FrameSizeBits: Byte;
   FrameSize64: Int64;
   PayloadLen, BaseHeaderSize, TotalHeaderSize, MaskOffset, PayloadOffset: Integer;
   Mask: array [0 .. 3] of Byte;
-  Payload: TBytes;
+  Payload, CloseReason: TBytes;
+  CloseStatusCode: Integer;
   i: Integer;
 begin
   Conn := TConnectionData(Socket.Data);
@@ -295,6 +444,28 @@ begin
     OPCODE := Conn.Buffer[0] and $0F;
     Masked := ((Conn.Buffer[1] and wsMASKED) = wsMASKED);
     FrameSizeBits := Conn.Buffer[1] and $7F;
+    IsControlFrame := OPCODE in [wsOpcodeClose, wsOpcodePing, wsOpcodePong];
+
+    if (Conn.Buffer[0] and $70) <> 0 then
+    begin
+      // RSV1-3 set without a negotiated extension that defines them
+      CloseWithError(Socket, wsCloseProtocolError);
+      Exit;
+    end;
+
+    if not (OPCODE in [wsOpcodeContinuation, wsOpcodeText, wsOpcodeBinary, wsOpcodeClose, wsOpcodePing,
+      wsOpcodePong]) then
+    begin
+      CloseWithError(Socket, wsCloseProtocolError);
+      Exit;
+    end;
+
+    if IsControlFrame and not LastFrame then
+    begin
+      // Control frames must not be fragmented
+      CloseWithError(Socket, wsCloseProtocolError);
+      Exit;
+    end;
 
     BaseHeaderSize := 2;
     if FrameSizeBits = 126 then
@@ -316,10 +487,16 @@ begin
     else
       FrameSize64 := FrameSizeBits;
 
+    if IsControlFrame and (FrameSize64 > 125) then
+    begin
+      CloseWithError(Socket, wsCloseProtocolError);
+      Exit;
+    end;
+
     if (FrameSize64 < 0) or (FrameSize64 > fMaxFrameSize) then
     begin
       // Bogus or oversized frame - refuse to allocate for it
-      Socket.Close;
+      CloseWithError(Socket, wsCloseMessageTooBig);
       Exit;
     end;
     PayloadLen := Integer(FrameSize64);
@@ -336,7 +513,7 @@ begin
     if not Masked then
     begin
       // RFC 6455: all client-to-server frames MUST be masked
-      Socket.Close;
+      CloseWithError(Socket, wsCloseProtocolError);
       Exit;
     end;
 
@@ -352,34 +529,72 @@ begin
     case OPCODE of
       wsOpcodeContinuation:
         begin
+          if not Conn.FragmentActive then
+          begin
+            // Continuation frame with no message in progress
+            CloseWithError(Socket, wsCloseProtocolError);
+            Exit;
+          end;
+
           Conn.FragmentBuffer := ConcatBytes(Conn.FragmentBuffer, Payload);
+          if Int64(Length(Conn.FragmentBuffer)) > fMaxFrameSize then
+          begin
+            CloseWithError(Socket, wsCloseMessageTooBig);
+            Exit;
+          end;
+
           if LastFrame then
           begin
             if Conn.FragmentIsText then
             begin
+              if not IsValidUTF8(Conn.FragmentBuffer) then
+              begin
+                CloseWithError(Socket, wsCloseInvalidPayload);
+                Exit;
+              end;
               if Assigned(OnClientFrameReceived) then
                 OnClientFrameReceived(Socket, TEncoding.UTF8.GetString(Conn.FragmentBuffer));
             end
             else if Assigned(OnClientBinaryFrameReceived) then
               OnClientBinaryFrameReceived(Socket, Conn.FragmentBuffer);
+            Conn.FragmentActive := False;
             Conn.FragmentBuffer := nil;
           end;
         end;
       wsOpcodeText:
         begin
+          if Conn.FragmentActive then
+          begin
+            // A new data frame arrived while a fragmented message was still in progress
+            CloseWithError(Socket, wsCloseProtocolError);
+            Exit;
+          end;
+
           if LastFrame then
           begin
+            if not IsValidUTF8(Payload) then
+            begin
+              CloseWithError(Socket, wsCloseInvalidPayload);
+              Exit;
+            end;
             if Assigned(OnClientFrameReceived) then
               OnClientFrameReceived(Socket, TEncoding.UTF8.GetString(Payload));
           end
           else
           begin
+            Conn.FragmentActive := True;
             Conn.FragmentIsText := True;
             Conn.FragmentBuffer := Payload;
           end;
         end;
       wsOpcodeBinary:
         begin
+          if Conn.FragmentActive then
+          begin
+            CloseWithError(Socket, wsCloseProtocolError);
+            Exit;
+          end;
+
           if LastFrame then
           begin
             if Assigned(OnClientBinaryFrameReceived) then
@@ -387,12 +602,38 @@ begin
           end
           else
           begin
+            Conn.FragmentActive := True;
             Conn.FragmentIsText := False;
             Conn.FragmentBuffer := Payload;
           end;
         end;
       wsOpcodeClose:
         begin
+          if Length(Payload) = 1 then
+          begin
+            CloseWithError(Socket, wsCloseProtocolError);
+            Exit;
+          end;
+
+          if Length(Payload) >= 2 then
+          begin
+            CloseStatusCode := (Payload[0] shl 8) or Payload[1];
+            if not IsValidCloseStatusCode(CloseStatusCode) then
+            begin
+              CloseWithError(Socket, wsCloseProtocolError);
+              Exit;
+            end;
+            if Length(Payload) > 2 then
+            begin
+              CloseReason := Copy(Payload, 2, Length(Payload) - 2);
+              if not IsValidUTF8(CloseReason) then
+              begin
+                CloseWithError(Socket, wsCloseInvalidPayload);
+                Exit;
+              end;
+            end;
+          end;
+
           try
             Socket.SendText(BytesToRawAnsiString(Seal(nil, wsOpcodeClose)));
           except
@@ -476,14 +717,33 @@ begin
   end;
 end;
 
+Procedure TWSServer.CloseWithError(var Socket: TCustomWinSocket; StatusCode: Word);
+var
+  Payload: TBytes;
+begin
+  SetLength(Payload, 2);
+  Payload[0] := Hi(StatusCode);
+  Payload[1] := Lo(StatusCode);
+  try
+    Socket.SendText(BytesToRawAnsiString(Seal(Payload, wsOpcodeClose)));
+  except
+    ; // socket may already have been closed by the peer
+  end;
+  Socket.Close;
+end;
+
 Procedure TWSServer.BroadcastRaw(const Sealed: AnsiString);
 var
   i: Integer;
+  Conn: TConnectionData;
 begin
   fSocket.Socket.Lock;
   try
     for i := 0 to fSocket.Socket.ActiveConnections - 1 do
     begin
+      Conn := TConnectionData(fSocket.Socket.Connections[i].Data);
+      if not Assigned(Conn) or (Conn.ConnectionType <> ctOpenedForWS) then
+        Continue;
       try
         fSocket.Socket.Connections[i].SendText(Sealed);
       except
